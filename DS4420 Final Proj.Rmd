@@ -1,0 +1,703 @@
+---
+title: "ML2PROJ"
+output: html_document
+date: "2025-12-01"
+---
+
+```{r data}
+library(nflreadr)
+library(dplyr)
+library(tidyverse)
+
+
+
+# Load all data
+weekly_data <- load_player_stats(seasons = 2024)
+
+colnames(weekly_data)
+
+```
+
+
+
+
+```{r specific pos}
+unique(weekly_data$position)
+# Investigate QB
+qb_data <- weekly_data %>% 
+  filter(position == "QB") %>%
+  select(player_name, week, 
+         completions, attempts, passing_yards, passing_tds)
+
+
+rb_data <- weekly_data %>% 
+  filter(position == "RB") %>%
+  select(player_name, week, 
+         carries, rushing_yards, rushing_tds, targets, receptions)
+
+qb_data
+rb_data
+
+```
+
+
+```{r injury}
+injury_data <- load_injuries(seasons = 2023)
+
+# Explore injuries
+glimpse(injury_data)
+
+# Common injuries
+injury_data %>%
+  count(report_primary_injury, sort = TRUE) %>%
+  head(20)
+
+# Injury status by position
+injury_data %>%
+  filter(!is.na(position)) %>%
+  count(position, report_status, sort = TRUE)
+
+
+library(ggplot2)
+
+
+# Histogram of injuries by position
+ggplot(injury_data %>% filter(!is.na(position)), 
+       aes(x = position)) +
+  geom_bar(fill = "coral", alpha = 0.8) +
+  labs(title = "Distribution of Injuries by Position",
+       subtitle = "NFL Injuries 2018-2023",
+       x = "Position", y = "Count") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
+
+
+
+```{r 1}
+
+# Now for the model
+
+weekly_stats <- load_player_stats(seasons = 2018:2023)
+injuries <- load_injuries(seasons = 2018:2023)
+
+
+injuries <- injuries %>%
+  filter(!report_primary_injury %in% c("Medical Illness", "Illness", "Non-Football Injury") | 
+         is.na(report_primary_injury))
+
+injury_clean <- injuries %>%
+
+  filter(!is.na(report_status) | !is.na(practice_status)) %>%
+  # Making injuries binary
+  mutate(
+    injured = case_when(
+      report_status %in% c("Out", "Doubtful", "Questionable") ~ 1,
+      practice_status %in% c("Out", "Limited", "Did Not Participate") ~ 1,
+      TRUE ~ 0
+    ),
+    injury_date = as.Date(date_modified)
+  ) %>%
+  select(gsis_id, full_name, position, team, season, week, 
+         injury_date, injured, report_primary_injury)
+
+
+injury_clean
+
+
+# Create a common key for merging
+merged_data <- weekly_stats %>%
+  # Create merge key: name + team + season + week
+  mutate(
+    merge_key = paste(tolower(player_display_name), 
+                      tolower(team), 
+                      season, 
+                      week, 
+                      sep = "_")
+  ) %>%
+  left_join(
+    injury_clean %>%
+      mutate(
+        merge_key = paste(tolower(full_name), 
+                          tolower(team), 
+                          season, 
+                          week, 
+                          sep = "_")
+      ) %>%
+      select(merge_key, injured, injury_date, report_primary_injury),
+    by = "merge_key"
+  ) %>%
+  # Fill NA injured with 0 (no injury reported)
+  mutate(
+    injured = ifelse(is.na(injured), 0, injured),
+    # Create target variable injured next week
+    injured_next_week = lead(injured, default = 0),
+    player_week_id = paste(player_id, season, week, sep = "_")
+  ) %>%
+  arrange(player_id, season, week) %>%
+  filter(season_type == "REG")  
+
+
+
+```
+
+```{r 2}
+library(zoo)
+library(dplyr)
+
+library(zoo)
+library(dplyr)
+
+model_data <- merged_data %>%
+  group_by(player_id) %>%
+  arrange(season, week) %>%
+  mutate(
+    
+    carries_3wk_avg = rollmean(carries, 3, fill = NA, align = "right"),
+    targets_3wk_avg = rollmean(targets, 3, fill = NA, align = "right"),
+    attempts_3wk_avg = rollmean(attempts, 3, fill = NA, align = "right"),
+    
+    carries_3wk_sd = rollapply(carries, 3, sd, fill = NA, align = "right"),
+    targets_3wk_sd = rollapply(targets, 3, sd, fill = NA, align = "right"),
+    
+    # Cumulative workload
+    season_carries = cumsum(carries),
+    season_targets = cumsum(targets),
+    season_attempts = cumsum(attempts),
+    
+    # Week-over-week change
+    carries_delta = carries - lag(carries, 1),
+    targets_delta = targets - lag(targets, 1),
+    attempts_delta = attempts - lag(attempts, 1),
+    
+  
+    injured_last_week = lag(injured, 1),
+    injured_last_3weeks = rollsum(injured, 3, fill = NA, align = "right") - injured,
+    days_since_last_injury = case_when(
+      injured_last_week == 1 ~ 7,
+      injured_last_3weeks > 0 ~ 14,
+      TRUE ~ 28
+    ),
+    
+    
+    yards_per_carry = ifelse(carries > 0, rushing_yards / carries, 0),
+    yards_per_target = ifelse(targets > 0, receiving_yards / targets, 0),
+    completion_pct = ifelse(attempts > 0, completions / attempts, 0),
+    
+    passing_epa = ifelse(exists("passing_epa"), passing_epa, NA),
+    rushing_epa = ifelse(exists("rushing_epa"), rushing_epa, NA),
+    receiving_epa = ifelse(exists("receiving_epa"), receiving_epa, NA),
+    
+   
+    high_contact_game = ifelse(carries > 15 | targets > 8, 1, 0),
+    sacks_suffered_binary = ifelse(sacks_suffered > 0, 1, 0),
+    tackles_suffered = ifelse(exists("def_tackles_solo"), 
+                              def_tackles_solo + def_tackles_with_assist, 0),
+    
+
+    week_scaled = scale(week),
+    late_season = ifelse(week > 12, 1, 0),
+    short_rest = ifelse(lag(week) == week - 1 & lag(week) %% 7 < 3, 1, 0),
+    
+   
+    opponent_toughness = ifelse(exists("opponent_team"), 
+                                sample(1:10, n(), replace = TRUE), 
+                                5),
+    
+   
+    position_group = case_when(
+      position %in% c("QB") ~ "QB",
+      position %in% c("RB", "FB") ~ "RB",
+      position %in% c("WR") ~ "WR",
+      position %in% c("TE") ~ "TE",
+      position %in% c("T", "G", "C", "OT", "OG") ~ "OL",
+      position %in% c("DT", "DE", "NT") ~ "DL",
+      position %in% c("LB", "ILB", "OLB") ~ "LB",
+      position %in% c("CB", "S", "FS", "SS", "DB") ~ "DB",
+      TRUE ~ "Other"
+    ),
+    
+
+    carries_x_high_contact = carries * high_contact_game,
+    targets_x_injured_last = targets * injured_last_week
+  ) %>%
+  ungroup() %>%
+  filter(!is.na(carries_3wk_avg), !is.na(targets_3wk_avg)) %>%
+  select(
+    player_id, player_name, position, position_group, team, season, week,
+    injured_next_week,  # TARGET
+    
+    # Workload
+    carries, targets, attempts, sacks_suffered,
+    carries_3wk_avg, targets_3wk_avg, attempts_3wk_avg,
+    carries_3wk_sd, targets_3wk_sd,
+    carries_delta, targets_delta, attempts_delta,
+    season_carries, season_targets, season_attempts,
+    
+    # Injury history
+    injured_last_week, injured_last_3weeks, days_since_last_injury,
+    
+    # Performance
+    yards_per_carry, yards_per_target, completion_pct,
+    passing_epa, rushing_epa, receiving_epa,
+    
+    # Contact and context
+    high_contact_game, sacks_suffered_binary, tackles_suffered,
+    week_scaled, late_season, short_rest, opponent_toughness,
+    
+    # Interactions
+    carries_x_high_contact, targets_x_injured_last,
+    
+    fantasy_points
+  )
+
+
+
+print(dim(model_data))
+print(mean(model_data$injured_next_week))
+
+
+model_data %>%
+  filter(player_id == "00-0023459") %>%
+  arrange(season, week)
+
+library(ggplot2)
+
+# Rolling carries distribution
+ggplot(model_data, aes(x = carries_3wk_avg)) +
+  geom_histogram(bins = 30, fill = "skyblue") +
+  labs(title = "Distribution of 3-week rolling carries")
+
+# Injury rate by week
+ggplot(model_data, aes(x = week, y = injured_next_week)) +
+  stat_summary(fun = mean, geom = "line") +
+  labs(title = "Average injury rate by week")
+
+
+```
+
+```{r model}
+
+
+
+# Identify rows with NA player_id
+na_rows <- which(is.na(model_data$player_id))
+
+
+# Remove rows with NA player_id 
+model_data_clean <- model_data %>% filter(!is.na(player_id))
+
+
+
+# Now create player indices from clean data
+player_factors <- factor(model_data_clean$player_id)
+player_idx <- as.numeric(player_factors)
+n_players <- length(levels(player_factors))
+
+
+
+b_start <- rep(0, n_players)
+
+ 
+# Prepare data 
+
+X_raw <- model_data_clean %>%
+  select(carries_3wk_avg, targets_3wk_avg, attempts_3wk_avg, 
+         carries_delta, targets_delta, attempts_delta,
+         sacks_suffered_binary, injured_last_week, 
+         week_scaled, late_season, short_rest,
+         high_contact_game, opponent_toughness,
+         carries_x_high_contact, targets_x_injured_last) %>%
+  mutate_all(~ifelse(is.na(.), 0, .)) %>%
+  as.matrix()
+
+
+# Scale continuous variables 
+X_continuous <- X_raw[, 1:10]  
+X_binary <- X_raw[, 11:ncol(X_raw)]  
+X <- cbind(1, X_continuous, X_binary)
+
+colnames(X) <- c(
+  "intercept",
+  "carries_3wk_avg",
+  "targets_3wk_avg",
+  "attempts_3wk_avg",
+  "carries_delta",
+  "targets_delta",
+  "attempts_delta",
+  "sacks_suffered_binary",
+  "injured_last_week",
+  "week_scaled",
+  "late_season",
+  "short_rest",
+  "high_contact_game",
+  "opponent_toughness",
+  "carries_x_high_contact",
+  "targets_x_injured_last"
+)
+
+# Note to self to use the clean data here Colin
+y <- model_data_clean$injured_next_week 
+
+
+player_factors <- factor(model_data_clean$player_id)
+player_idx <- as.numeric(player_factors)
+n_players <- length(levels(player_factors))
+
+
+
+tryCatch({
+  simple_glm <- glm(y ~ X[,-1], family = binomial)
+  beta_start <- coef(simple_glm)
+  cat("GLM converged")
+}, error = function(e) {
+  cat("GLM failed")
+ 
+  logit_injury_rate <- log(mean(y) / (1 - mean(y)))
+  beta_start <- c(logit_injury_rate, 0.1, 0.1, 0.05, 0, 0.2, 0.5)
+})
+
+# Random effects initialization
+b_start <- rep(0, n_players)
+
+
+n_iter <- 2000
+burn_in <- 500
+
+# Storage 
+beta_samples <- matrix(0, n_iter, ncol(X))
+colnames(beta_samples) <- colnames(X)
+b_samples <- matrix(0, n_iter, n_players)  # Store random effects
+sigma_b_samples <- numeric(n_iter)
+accept_beta <- numeric(n_iter)
+
+
+beta_prop_sd <- rep(0.1, ncol(X))  
+sigma_b_prior <- 1
+
+# Helper function for stable log-likelihood 
+log_likelihood <- function(y, X, beta, b, player_idx) {
+  eta <- X %*% beta + b[player_idx]
+  
+  # Bound eta to prevent overflow
+  eta <- pmin(pmax(eta, -20), 20)
+  
+  # Calculate probabilities
+  p <- 1 / (1 + exp(-eta))
+  
+  # Avoid log(0)
+  eps <- 1e-12
+  p <- pmin(pmax(p, eps), 1 - eps)
+  
+  # Log-likelihood
+  sum(y * log(p) + (1 - y) * log(1 - p))
+}
+
+# Priors function
+log_prior <- function(beta, b, sigma_b) {
+  # Prior for beta:
+  beta_prior <- sum(dnorm(beta, 0, 3, log = TRUE))
+  
+  # Prior for b: 
+  b_prior <- sum(dnorm(b, 0, sigma_b, log = TRUE))
+  
+  # Prior for sigma_b:
+  sigma_b_prior <- dcauchy(sigma_b, 0, 2.5, log = TRUE)
+  
+  beta_prior + b_prior + sigma_b_prior
+}
+
+# MCMC loop
+
+pb <- txtProgressBar(min = 0, max = n_iter, style = 3)
+
+for (iter in 1:n_iter) {
+  
+  # Update each beta one at a time
+  for (j in 1:ncol(X)) {
+    beta_prop <- beta_start
+    beta_prop[j] <- beta_start[j] + rnorm(1, 0, beta_prop_sd[j])
+    
+    # Calculate log-likelihoods
+    ll_current <- log_likelihood(y, X, beta_start, b_start, player_idx)
+    ll_prop <- log_likelihood(y, X, beta_prop, b_start, player_idx)
+    
+    # Priors (only beta part changes)
+    prior_current <- dnorm(beta_start[j], 0, 3, log = TRUE)
+    prior_prop <- dnorm(beta_prop[j], 0, 3, log = TRUE)
+    
+    # MH ratio
+    log_alpha <- (ll_prop + prior_prop) - (ll_current + prior_current)
+    
+    if (!is.na(log_alpha) && log(runif(1)) < log_alpha) {
+      beta_start <- beta_prop
+      accept_beta[iter] <- accept_beta[iter] + 1/ncol(X)
+    }
+  }
+  
+  # Update random effects 
+  if (iter %% 5 == 0) {  
+    for (p in sample(1:n_players, min(100, n_players))) {
+      b_prop <- b_start
+      b_prop[p] <- b_start[p] + rnorm(1, 0, 0.1)
+      
+      ll_current <- log_likelihood(y, X, beta_start, b_start, player_idx)
+      ll_prop <- log_likelihood(y, X, beta_start, b_prop, player_idx)
+      
+      # Priors for random effects
+      prior_current <- dnorm(b_start[p], 0, sigma_b_prior, log = TRUE)
+      prior_prop <- dnorm(b_prop[p], 0, sigma_b_prior, log = TRUE)
+      
+      log_alpha <- (ll_prop + prior_prop) - (ll_current + prior_current)
+      
+      if (!is.na(log_alpha) && log(runif(1)) < log_alpha) {
+        b_start <- b_prop
+      }
+    }
+  }
+  
+  # Update sigma_b 
+  sigma_b_prior <- sqrt(1/rgamma(1, shape = n_players/2 + 0.5, 
+                                 rate = sum(b_start^2)/2 + 0.5))
+  
+  # Store
+  beta_samples[iter, ] <- beta_start
+  b_samples[iter, ] <- b_start 
+  sigma_b_samples[iter] <- sigma_b_prior
+  
+  setTxtProgressBar(pb, iter)
+  
+  # Progress
+  if (iter %% 200 == 0) {
+    cat(sprintf("\nIter %d: Beta1 = %.3f, Accept = %.3f, sigma_b = %.3f", 
+                iter, beta_start[1], 
+                mean(accept_beta[max(1, iter-199):iter]),
+                sigma_b_prior))
+  }
+}
+
+close(pb)
+
+# Results and evaluation
+
+post_samples <- (burn_in + 1):n_iter
+
+# Posterior means
+post_beta <- colMeans(beta_samples[post_samples, ])
+post_sigma_b <- mean(sigma_b_samples[post_samples])
+
+cat("Posterior means:\n")
+for (j in 1:ncol(X)) {
+  cat(sprintf("%-15s: %7.3f\n", colnames(X)[j], post_beta[j]))
+}
+cat(sprintf("sigma_b: %7.3f\n", post_sigma_b))
+
+# Acceptance rates
+cat(sprintf("\nAcceptance rate for beta: %.3f\n", mean(accept_beta[post_samples])))
+
+# Predictions
+eta_pred <- X %*% post_beta + b_start[player_idx]
+pred_probs <- 1 / (1 + exp(-eta_pred))
+
+
+# Baseline: always predict no injury
+baseline_acc <- mean(y == 0)
+cat(sprintf("Baseline accuracy (predict 0): %.3f\n", baseline_acc))
+
+# Calculate AUC-ROC
+if (require(pROC)) {
+  roc_obj <- roc(y, pred_probs)
+  cat(sprintf("AUC-ROC: %.3f\n", auc(roc_obj)))
+}
+
+# Find optimal threshold using F1-score
+thresholds <- seq(0.01, 0.3, by = 0.01)
+results <- data.frame()
+
+for (thresh in thresholds) {
+  pred_class <- ifelse(pred_probs > thresh, 1, 0)
+  
+  tp <- sum(pred_class == 1 & y == 1)
+  fp <- sum(pred_class == 1 & y == 0)
+  fn <- sum(pred_class == 0 & y == 1)
+  tn <- sum(pred_class == 0 & y == 0)
+  
+  accuracy <- (tp + tn) / (tp + tn + fp + fn)
+  precision <- ifelse(tp + fp > 0, tp / (tp + fp), 0)
+  recall <- ifelse(tp + fn > 0, tp / (tp + fn), 0)
+  f1 <- ifelse(precision + recall > 0, 
+               2 * precision * recall / (precision + recall), 0)
+  
+  results <- rbind(results, data.frame(
+    threshold = thresh,
+    accuracy = accuracy,
+    precision = precision,
+    recall = recall,
+    f1 = f1,
+    tp = tp,
+    fp = fp,
+    fn = fn,
+    tn = tn
+  ))
+}
+
+# Find optimal threshold
+optimal_idx <- which.max(results$f1)
+optimal_thresh <- results$threshold[optimal_idx]
+
+cat("\nOptimal threshold (max F1):", optimal_thresh, "\n")
+cat("At this threshold:\n")
+cat(sprintf("  Accuracy:  %.3f\n", results$accuracy[optimal_idx]))
+cat(sprintf("  Precision: %.3f\n", results$precision[optimal_idx]))
+cat(sprintf("  Recall:    %.3f\n", results$recall[optimal_idx]))
+cat(sprintf("  F1-score:  %.3f\n", results$f1[optimal_idx]))
+cat(sprintf("  TP: %d, FP: %d, FN: %d, TN: %d\n", 
+            results$tp[optimal_idx], results$fp[optimal_idx],
+            results$fn[optimal_idx], results$tn[optimal_idx]))
+
+# Visualizations
+par(mfrow = c(2, 3))
+
+# Trace plots
+plot(beta_samples[, 1], type = "l", main = "Intercept Trace",
+     xlab = "Iteration", ylab = "Value", col = "blue")
+abline(v = burn_in, col = "red", lty = 2)
+
+plot(beta_samples[, 7], type = "l", main = "Injured Last Week Trace",
+     xlab = "Iteration", ylab = "Value", col = "blue")
+abline(v = burn_in, col = "red", lty = 2)
+
+# Posterior distributions
+hist(beta_samples[post_samples, 1], breaks = 30, 
+     main = "Intercept Posterior", xlab = "Value", 
+     col = "lightblue", freq = FALSE)
+abline(v = post_beta[1], col = "red", lwd = 2)
+
+hist(beta_samples[post_samples, 7], breaks = 30,
+     main = "Injured Last Week Posterior", xlab = "Value",
+     col = "lightblue", freq = FALSE)
+abline(v = post_beta[7], col = "red", lwd = 2)
+
+# Predicted vs actual
+plot(pred_probs, jitter(y, 0.1), 
+     xlab = "Predicted Probability", ylab = "Actual (jittered)",
+     main = "Predicted vs Actual", pch = 16, cex = 0.5, col = rgb(0,0,0,0.2))
+abline(v = optimal_thresh, col = "red", lty = 2)
+
+# F1-score by threshold
+plot(results$threshold, results$f1, type = "l",
+     xlab = "Threshold", ylab = "F1-score",
+     main = "F1-score by Threshold")
+abline(v = optimal_thresh, col = "red", lty = 2)
+points(optimal_thresh, results$f1[optimal_idx], col = "red", pch = 16)
+
+par(mfrow = c(1, 1))
+
+
+
+cat("Coefficients represent log-odds ratios:\n")
+for (j in 2:ncol(X)) {
+  odds_ratio <- exp(post_beta[j])
+  cat(sprintf("%-15s: OR = %.3f", colnames(X)[j], odds_ratio))
+  
+  if (odds_ratio > 1.1) {
+    cat(" (INCREASES injury risk)\n")
+  } else if (odds_ratio < 0.9) {
+    cat(" (DECREASES injury risk)\n")
+  } else {
+    cat(" (little effect)\n")
+  }
+}
+```
+
+
+```{r predictions}
+
+# Get posterior means from your MCMC output
+beta_post_means <- colMeans(beta_samples[(burn_in+1):n_iter, ])
+b_post_means <- numeric(n_players) 
+
+
+eta_point <- X %*% beta_post_means + b_start[player_idx]
+pred_prob_point <- 1 / (1 + exp(-eta_point))
+
+
+n_post <- 500
+post_indices <- sample((burn_in+1):n_iter, n_post, replace = TRUE)
+
+# Store predictions
+pred_samples <- matrix(0, nrow = nrow(X), ncol = n_post)
+
+for (i in 1:n_post) {
+  idx <- post_indices[i]
+  eta_i <- X %*% beta_samples[idx, ] + b_start[player_idx]
+  pred_samples[, i] <- 1 / (1 + exp(-eta_i))
+}
+
+# Average predictions across posterior samples
+pred_prob_mean <- rowMeans(pred_samples)
+
+# Evaluate predictions
+library(pROC)
+roc_obj <- roc(y, pred_prob_mean)
+auc_value <- auc(roc_obj)
+
+
+cat("AUC-ROC:", round(auc_value, 3), "\n")
+
+# Find optimal threshold
+pred_class_optimal <- ifelse(pred_prob_mean > optimal_thresh, 1, 0)
+conf_matrix <- table(Predicted = pred_class_optimal, Actual = y)
+print(conf_matrix)
+
+# Calculate metrics
+accuracy <- sum(diag(conf_matrix)) / sum(conf_matrix)
+precision <- conf_matrix[2,2] / sum(conf_matrix[2,])
+recall <- conf_matrix[2,2] / sum(conf_matrix[,2])
+f1 <- 2 * precision * recall / (precision + recall)
+
+cat("\nPerformance at optimal threshold:\n")
+cat(sprintf("Accuracy:  %.3f\n", accuracy))
+cat(sprintf("Precision: %.3f\n", precision))
+cat(sprintf("Recall:    %.3f\n", recall))
+cat(sprintf("F1-score:  %.3f\n", f1))
+
+# Visualize predictions
+par(mfrow = c(1, 2))
+
+# ROC curve
+plot(roc_obj, main = paste("ROC Curve (AUC =", round(auc_value, 3), ")"))
+
+
+# Distribution of predicted probabilities by actual class
+par(mfrow = c(1, 2))
+hist(pred_prob_mean[y == 0], breaks = 30, 
+     main = "No Injury Next Week", 
+     xlab = "Predicted Probability",
+     col = rgb(0, 0.5, 0, 0.5), xlim = c(0, 1))
+abline(v = optimal_thresh, col = "red", lty = 2, lwd = 2)
+
+hist(pred_prob_mean[y == 1], breaks = 30,
+     main = "Injury Next Week",
+     xlab = "Predicted Probability",
+     col = rgb(0.5, 0, 0, 0.5), xlim = c(0, 1))
+abline(v = optimal_thresh, col = "red", lty = 2, lwd = 2)
+
+par(mfrow = c(1, 1))
+
+
+pred_bins <- cut(pred_prob_mean, breaks = seq(0, 1, by = 0.1))
+actual_rate <- tapply(y, pred_bins, mean)
+pred_rate <- tapply(pred_prob_mean, pred_bins, mean)
+
+plot(pred_rate, actual_rate, 
+     xlab = "Mean Predicted Probability", 
+     ylab = "Actual Injury Rate",
+     main = "Calibration Plot",
+     xlim = c(0, 1), ylim = c(0, 1),
+     pch = 16, col = "blue")
+abline(a = 0, b = 1, col = "red", lty = 2)
+```
+
+
