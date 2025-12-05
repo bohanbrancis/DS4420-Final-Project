@@ -64,7 +64,7 @@ library(ggplot2)
 # Histogram of injuries by position
 ggplot(injury_data %>% filter(!is.na(position)), 
        aes(x = position)) +
-  geom_bar(fill = "coral", alpha = 0.8) +
+  geom_bar(fill = "coral") +
   labs(title = "Distribution of Injuries by Position",
        subtitle = "NFL Injuries 2018-2023",
        x = "Position", y = "Count") +
@@ -501,7 +501,6 @@ eta_pred <- X %*% post_beta + b_start[player_idx]
 pred_probs <- 1 / (1 + exp(-eta_pred))
 
 
-# Baseline: always predict no injury
 baseline_acc <- mean(y == 0)
 cat(sprintf("Baseline accuracy (predict 0): %.3f\n", baseline_acc))
 
@@ -547,7 +546,6 @@ optimal_idx <- which.max(results$f1)
 optimal_thresh <- results$threshold[optimal_idx]
 
 cat("\nOptimal threshold (max F1):", optimal_thresh, "\n")
-cat("At this threshold:\n")
 cat(sprintf("  Accuracy:  %.3f\n", results$accuracy[optimal_idx]))
 cat(sprintf("  Precision: %.3f\n", results$precision[optimal_idx]))
 cat(sprintf("  Recall:    %.3f\n", results$recall[optimal_idx]))
@@ -557,31 +555,30 @@ cat(sprintf("  TP: %d, FP: %d, FN: %d, TN: %d\n",
             results$fn[optimal_idx], results$tn[optimal_idx]))
 
 # Visualizations
-par(mfrow = c(2, 3))
 
 # Trace plots
 plot(beta_samples[, 1], type = "l", main = "Intercept Trace",
      xlab = "Iteration", ylab = "Value", col = "blue")
-abline(v = burn_in, col = "red", lty = 2)
+abline(v = burn_in, col = "red")
 
 plot(beta_samples[, 7], type = "l", main = "Injured Last Week Trace",
      xlab = "Iteration", ylab = "Value", col = "blue")
-abline(v = burn_in, col = "red", lty = 2)
+abline(v = burn_in, col = "red")
 
 # Posterior distributions
 hist(beta_samples[post_samples, 1], breaks = 30, 
      main = "Intercept Posterior", xlab = "Value", 
      col = "lightblue", freq = FALSE)
-abline(v = post_beta[1], col = "red", lwd = 2)
+abline(v = post_beta[1], col = "red")
 
 hist(beta_samples[post_samples, 7], breaks = 30,
      main = "Injured Last Week Posterior", xlab = "Value",
      col = "lightblue", freq = FALSE)
-abline(v = post_beta[7], col = "red", lwd = 2)
+abline(v = post_beta[7], col = "red")
 
 # Predicted vs actual
 plot(pred_probs, jitter(y, 0.1), 
-     xlab = "Predicted Probability", ylab = "Actual (jittered)",
+     xlab = "Predicted Probability", ylab = "Actual",
      main = "Predicted vs Actual", pch = 16, cex = 0.5, col = rgb(0,0,0,0.2))
 abline(v = optimal_thresh, col = "red", lty = 2)
 
@@ -596,7 +593,7 @@ par(mfrow = c(1, 1))
 
 
 
-cat("Coefficients represent log-odds ratios:\n")
+
 for (j in 2:ncol(X)) {
   odds_ratio <- exp(post_beta[j])
   cat(sprintf("%-15s: OR = %.3f", colnames(X)[j], odds_ratio))
@@ -676,15 +673,9 @@ hist(pred_prob_mean[y == 0], breaks = 30,
      main = "No Injury Next Week", 
      xlab = "Predicted Probability",
      col = rgb(0, 0.5, 0, 0.5), xlim = c(0, 1))
-abline(v = optimal_thresh, col = "red", lty = 2, lwd = 2)
+abline(v = optimal_thresh, col = "red")
 
-hist(pred_prob_mean[y == 1], breaks = 30,
-     main = "Injury Next Week",
-     xlab = "Predicted Probability",
-     col = rgb(0.5, 0, 0, 0.5), xlim = c(0, 1))
-abline(v = optimal_thresh, col = "red", lty = 2, lwd = 2)
 
-par(mfrow = c(1, 1))
 
 
 pred_bins <- cut(pred_prob_mean, breaks = seq(0, 1, by = 0.1))
@@ -695,9 +686,8 @@ plot(pred_rate, actual_rate,
      xlab = "Mean Predicted Probability", 
      ylab = "Actual Injury Rate",
      main = "Calibration Plot",
-     xlim = c(0, 1), ylim = c(0, 1),
-     pch = 16, col = "blue")
-abline(a = 0, b = 1, col = "red", lty = 2)
+     xlim = c(0, 1), ylim = c(0, 1), col = "blue")
+abline(a = 0, b = 1, col = "red")
 ```
 
 
